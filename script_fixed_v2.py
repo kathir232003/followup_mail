@@ -515,63 +515,95 @@ def send_emails():
         # Check if this should be sent as a follow-up (reply)
         is_follow_up_email = is_follow_up_mode and recipient_email in message_threads
         
-        # Prepare subject with RE: prefix for follow-ups
-        final_subject = formatted_subject
-        if is_follow_up_email:
-            if not formatted_subject.startswith("RE:"):
-                final_subject = f"RE: {formatted_subject}"
-        
-        # Prepare email data
-        email_data = {
-            "message": {
-                "subject": final_subject,
-                "body": {"contentType": "HTML", "content": formatted_message},
-                "toRecipients": [{"emailAddress": {"address": recipient_email}}]
-            }
-        }
-        
-        # Add threading headers for follow-up emails
-        if is_follow_up_email and recipient_email in message_threads:
-            email_data["message"]["internetMessageHeaders"] = [
-                {
-                    "name": "In-Reply-To",
-                    "value": message_threads[recipient_email]
-                },
-                {
-                    "name": "References",
-                    "value": message_threads[recipient_email]
-                }
-            ]
-            # Add conversation ID if available
-            if recipient_email in conversation_ids:
-                email_data["message"]["conversationId"] = conversation_ids[recipient_email]
-       
         try:
-            # Send the email
-            response = requests.post(
-                f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail",
-                headers=headers,
-                data=json.dumps(email_data)
-            )
-            
+            if is_follow_up_email:
+                # --- Follow-up Email Logic using createReply ---
+                original_message_id = message_threads.get(recipient_email)
+                if not original_message_id:
+                    update_status(f"✗ No message ID for {recipient_email}", "red")
+                    failed_count += 1
+                    continue
+
+                # 1. Create a reply draft
+                create_reply_url = f"https://graph.microsoft.com/v1.0/users/{sender_email}/messages/{original_message_id}/createReply"
+                reply_draft_response = requests.post(create_reply_url, headers=headers)
+
+                if reply_draft_response.status_code == 401:
+                    token = get_access_token(force_refresh=True)
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        reply_draft_response = requests.post(create_reply_url, headers=headers)
+
+                if reply_draft_response.status_code != 201:
+                    update_status(f"✗ Failed to create draft for {recipient_email} ({reply_draft_response.status_code})", "red")
+                    failed_count += 1
+                    continue
+
+                draft_message = reply_draft_response.json()
+                draft_id = draft_message.get('id')
+
+                # 2. Update the draft with the new subject and body
+                final_subject = formatted_subject
+                if not final_subject.startswith("RE:"):
+                    final_subject = f"RE: {final_subject}"
+
+                update_draft_url = f"https://graph.microsoft.com/v1.0/users/{sender_email}/messages/{draft_id}"
+                draft_update_payload = {
+                    "subject": final_subject,
+                    "body": {
+                        "contentType": "HTML",
+                        "content": formatted_message
+                    }
+                }
+                update_response = requests.patch(update_draft_url, headers=headers, data=json.dumps(draft_update_payload))
+
+                if update_response.status_code == 401:
+                    token = get_access_token(force_refresh=True)
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        update_response = requests.patch(update_draft_url, headers=headers, data=json.dumps(draft_update_payload))
+
+                if update_response.status_code != 200:
+                    update_status(f"✗ Failed to update draft for {recipient_email}", "red")
+                    failed_count += 1
+                    continue
+
+                # 3. Send the draft
+                send_draft_url = f"https://graph.microsoft.com/v1.0/users/{sender_email}/messages/{draft_id}/send"
+                response = requests.post(send_draft_url, headers=headers)
+
+            else:
+                # --- Initial Email Logic ---
+                email_data = {
+                    "message": {
+                        "subject": formatted_subject,
+                        "body": {"contentType": "HTML", "content": formatted_message},
+                        "toRecipients": [{"emailAddress": {"address": recipient_email}}]
+                    }
+                }
+                response = requests.post(
+                    f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail",
+                    headers=headers,
+                    data=json.dumps(email_data)
+                )
+
             if response.status_code == 202:
                 tree.set(index, "Status", "Sent")
                 success_count += 1
                 email_type = "follow-up" if is_follow_up_email else "new"
                 update_status(f"✓ {email_type.title()} email sent to: {recipient_email}", "green")
                 
-                # Store message ID for future threading (only for new emails, not follow-ups)
                 if not is_follow_up_email:
-                    # Wait a moment for the email to be processed
-                    time.sleep(2)
-                    
-                    # Get the sent message details
+                    time.sleep(3)  # Wait a bit longer for the message to appear in Sent Items
                     message_details = get_sent_message_details(sender_email, recipient_email, headers)
-                    if message_details:
+                    if message_details and message_details.get('messageId'):
                         message_threads[recipient_email] = message_details['messageId']
-                        conversation_ids[recipient_email] = message_details['conversationId']
-                        save_thread_data()  # Save to file for persistence
-            
+                        conversation_ids[recipient_email] = message_details.get('conversationId')
+                        save_thread_data()
+                        update_status(f"✓ Thread captured for {recipient_email}", "green")
+                    else:
+                        update_status(f"⚠ Thread capture failed for {recipient_email}", "orange")
+
             elif response.status_code == 401:
                 # Token expired - try refreshing once
                 update_status("Token expired, refreshing...", "orange")
@@ -579,11 +611,15 @@ def send_emails():
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
                     # Retry the request
-                    response = requests.post(
-                        f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail",
-                        headers=headers,
-                        data=json.dumps(email_data)
-                    )
+                    if is_follow_up_email:
+                        send_draft_url = f"https://graph.microsoft.com/v1.0/users/{sender_email}/messages/{draft_id}/send"
+                        response = requests.post(send_draft_url, headers=headers)
+                    else:
+                        response = requests.post(
+                            f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail",
+                            headers=headers,
+                            data=json.dumps(email_data)
+                        )
                     if response.status_code == 202:
                         tree.set(index, "Status", "Sent")
                         success_count += 1
