@@ -124,61 +124,35 @@ def clear_thread_data():
     update_status("Thread data cleared", "orange")
 
 def get_sent_message_details(sender_email, recipient_email, headers):
-    """Get details of the most recent sent message to a recipient with retry logic"""
+    """Get details of the most recent sent message with retry logic"""
     max_attempts = 3
     wait_time = 3  # Start with 3 seconds
     
     for attempt in range(max_attempts):
         try:
-            # Use a more flexible filter and increase wait time on each attempt
-            sent_messages_response = requests.get(
-                f"https://graph.microsoft.com/v1.0/users/{sender_email}/mailFolders/SentItems/messages"
-                f"?$top=5"  # Get top 5 instead of 1 for better matching
-                f"&$filter=toRecipients/any(r:r/emailAddress/address eq '{recipient_email}')"
-                f"&$select=internetMessageId,conversationId,id,sentDateTime"
-                f"&$orderby=sentDateTime desc",
-                headers=headers
-            )
+            # Get the most recent sent message
+            url = (f"https://graph.microsoft.com/v1.0/users/{sender_email}/mailFolders/SentItems/messages"
+                   f"?$top=1&$orderby=sentDateTime desc"
+                   f"&$select=internetMessageId,conversationId,id")
+
+            sent_messages_response = requests.get(url, headers=headers)
             
             if sent_messages_response.status_code == 200:
                 sent_data = sent_messages_response.json()
                 messages = sent_data.get('value', [])
                 
                 if messages:
-                    # Get the most recent message (first in the ordered list)
                     message_info = messages[0]
-                    
-                    # Verify this message was sent recently (within last 5 minutes)
-                    import datetime
-                    sent_time_str = message_info.get('sentDateTime', '')
-                    if sent_time_str:
-                        try:
-                            # Parse the datetime and check if it's recent
-                            sent_time = datetime.datetime.fromisoformat(sent_time_str.replace('Z', '+00:00'))
-                            current_time = datetime.datetime.now(datetime.timezone.utc)
-                            time_diff = (current_time - sent_time).total_seconds()
-                            
-                            # Only use if sent within last 5 minutes (300 seconds)
-                            if time_diff <= 300:
-                                update_status(f"Thread info captured for {recipient_email}", "green")
-                                return {
-                                    'internetMessageId': message_info.get('internetMessageId'),
-                                    'conversationId': message_info.get('conversationId'),
-                                    'messageId': message_info.get('id')
-                                }
-                        except Exception as date_error:
-                            print(f"Error parsing date: {date_error}")
-                            # If date parsing fails, still return the message info
-                            update_status(f"Thread info captured for {recipient_email} (no date verification)", "orange")
-                            return {
-                                'internetMessageId': message_info.get('internetMessageId'),
-                                'conversationId': message_info.get('conversationId'),
-                                'messageId': message_info.get('id')
-                            }
+                    update_status(f"Thread info captured for {recipient_email}", "green")
+                    return {
+                        'internetMessageId': message_info.get('internetMessageId'),
+                        'conversationId': message_info.get('conversationId'),
+                        'messageId': message_info.get('id')
+                    }
             
             # If no message found and not the last attempt, wait and retry
             if attempt < max_attempts - 1:
-                update_status(f"Waiting for message to appear in sent items... (attempt {attempt + 1})", "orange")
+                update_status(f"Waiting for message to appear in Sent Items... (attempt {attempt + 1})", "orange")
                 time.sleep(wait_time)
                 wait_time += 2  # Increase wait time for next attempt
                 
